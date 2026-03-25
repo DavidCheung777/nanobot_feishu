@@ -17,16 +17,63 @@ except ModuleNotFoundError:
     InternalTenantAccessTokenRequest = None
     InternalTenantAccessTokenRequestBody = None
 
-from .domains import (
-    ImMixin,
-    DocxMixin,
-    BitableMixin,
-    CalendarMixin,
-    DriveMixin,
-    TaskMixin,
-    WikiMixin,
-    TroubleshootMixin,
-)
+mixin_classes = []
+
+try:
+    from .domains import ImMixin
+    if ImMixin is not None:
+        mixin_classes.append(ImMixin)
+except ImportError:
+    pass
+
+try:
+    from .domains import DocxMixin
+    if DocxMixin is not None:
+        mixin_classes.append(DocxMixin)
+except ImportError:
+    pass
+
+try:
+    from .domains import BitableMixin
+    if BitableMixin is not None:
+        mixin_classes.append(BitableMixin)
+except ImportError:
+    pass
+
+try:
+    from .domains import CalendarMixin
+    if CalendarMixin is not None:
+        mixin_classes.append(CalendarMixin)
+except ImportError:
+    pass
+
+try:
+    from .domains import DriveMixin
+    if DriveMixin is not None:
+        mixin_classes.append(DriveMixin)
+except ImportError:
+    pass
+
+try:
+    from .domains import TaskMixin
+    if TaskMixin is not None:
+        mixin_classes.append(TaskMixin)
+except ImportError:
+    pass
+
+try:
+    from .domains import WikiMixin
+    if WikiMixin is not None:
+        mixin_classes.append(WikiMixin)
+except ImportError:
+    pass
+
+try:
+    from .domains import TroubleshootMixin
+    if TroubleshootMixin is not None:
+        mixin_classes.append(TroubleshootMixin)
+except ImportError:
+    pass
 
 
 class _FeishuCore:
@@ -377,5 +424,4 @@ class _FeishuCore:
             return self._wrap_exception(e, "原生请求")
 
 
-class FeishuClient(ImMixin, DocxMixin, BitableMixin, CalendarMixin, DriveMixin, TaskMixin, WikiMixin, TroubleshootMixin, _FeishuCore):
-    pass
+FeishuClient = type('FeishuClient', tuple(mixin_classes + [_FeishuCore]), {})
