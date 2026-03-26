@@ -5,8 +5,14 @@ Feishu/Lark OpenAPI Python Client
 """
 import os
 import json
+import time
+import base64
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Optional, Dict, Any, Union, Callable, List, Tuple
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 try:
     import lark_oapi as lark
@@ -16,6 +22,18 @@ except ModuleNotFoundError:
     lark = None
     InternalTenantAccessTokenRequest = None
     InternalTenantAccessTokenRequestBody = None
+
+LARK_ERROR = {
+    "APP_SCOPE_MISSING": 99991672,
+    "USER_SCOPE_INSUFFICIENT": 99991679,
+    "TOKEN_INVALID": 99991668,
+    "TOKEN_EXPIRED": 99991677,
+    "REFRESH_SERVER_ERROR": 20050,
+    "REFRESH_TOKEN_EXPIRED": 20037,
+}
+
+TOKEN_RETRY_CODES = {LARK_ERROR["TOKEN_INVALID"], LARK_ERROR["TOKEN_EXPIRED"]}
+REFRESH_TOKEN_RETRYABLE = {LARK_ERROR["REFRESH_SERVER_ERROR"]}
 
 mixin_classes = []
 
@@ -117,22 +135,46 @@ class _FeishuCore:
             .log_level(lark.LogLevel.ERROR) \
             .build()
         self._user_access_token_provider: Optional[Callable[[], str]] = None
+        self._user_access_token_refresher: Optional[Callable[[], Optional[str]]] = None
+        self._user_access_token_cache: Optional[str] = None
+        self._user_access_token_lock = Lock()
+        self._uat_store: Dict[str, Dict[str, Any]] = {}
+        self._uat_store_lock = Lock()
+        self._uat_refresh_locks: Dict[str, Lock] = {}
 
     def set_user_access_token_provider(self, provider: Optional[Callable[[], str]]) -> "FeishuClient":
         self._user_access_token_provider = provider
         return self
 
+    def set_user_access_token_refresher(self, refresher: Optional[Callable[[], Optional[str]]]) -> "FeishuClient":
+        self._user_access_token_refresher = refresher
+        return self
+
     def _get_user_access_token(self, user_access_token: Optional[str] = None) -> str:
         if user_access_token:
+            self._user_access_token_cache = user_access_token
             return user_access_token
         if self._user_access_token_provider is not None:
             token = self._user_access_token_provider()
             if token:
+                self._user_access_token_cache = token
                 return token
+        if self._user_access_token_cache:
+            return self._user_access_token_cache
         token = os.environ.get("FEISHU_USER_ACCESS_TOKEN")
         if token:
+            self._user_access_token_cache = token
             return token
         raise ValueError("缺少 user_access_token：请传参或通过 set_user_access_token_provider 提供，或设置环境变量 FEISHU_USER_ACCESS_TOKEN")
+
+    def _refresh_user_access_token(self) -> Optional[str]:
+        if self._user_access_token_refresher is None:
+            return None
+        with self._user_access_token_lock:
+            token = self._user_access_token_refresher()
+        if token:
+            self._user_access_token_cache = token
+        return token
 
     def _coerce_datetime_to_ms(self, value: Optional[Union[str, int, float]]) -> Optional[str]:
         if value is None:
@@ -211,20 +253,29 @@ class _FeishuCore:
             if params:
                 queries = [(str(k), str(v)) for k, v in params.items() if v is not None]
 
-            req_builder = lark.BaseRequest.builder() \
-                .http_method(http_method_enum) \
-                .uri(uri) \
-                .token_types(token_types)
-            if queries:
-                req_builder = req_builder.queries(queries)
-            if final_headers:
-                req_builder = req_builder.headers(final_headers)
-            if body is not None:
-                req_builder = req_builder.body(body)
-            req = req_builder.build()
+            def send_request(headers_payload: Dict[str, str]) -> Dict:
+                req_builder = lark.BaseRequest.builder() \
+                    .http_method(http_method_enum) \
+                    .uri(uri) \
+                    .token_types(token_types)
+                if queries:
+                    req_builder = req_builder.queries(queries)
+                if headers_payload:
+                    req_builder = req_builder.headers(headers_payload)
+                if body is not None:
+                    req_builder = req_builder.body(body)
+                req = req_builder.build()
+                resp = self.client.request(req)
+                return self._parse_lark_response(resp)
 
-            resp = self.client.request(req)
-            return self._parse_lark_response(resp)
+            result = send_request(final_headers)
+            if token_type == "user" and result.get("code") in TOKEN_RETRY_CODES:
+                refreshed = self._refresh_user_access_token()
+                if refreshed:
+                    retry_headers = dict(final_headers)
+                    retry_headers["Authorization"] = f"Bearer {refreshed}"
+                    result = send_request(retry_headers)
+            return self._map_auth_result(result, path)
         except Exception as e:
             return self._wrap_exception(e, "请求")
 
@@ -276,28 +327,38 @@ class _FeishuCore:
             if params:
                 queries = [(str(k), str(v)) for k, v in params.items() if v is not None]
 
-            req_builder = lark.BaseRequest.builder() \
-                .http_method(http_method_enum) \
-                .uri(uri) \
-                .token_types(token_types)
-            if queries:
-                req_builder = req_builder.queries(queries)
-            if final_headers:
-                req_builder = req_builder.headers(final_headers)
-            if body is not None:
-                req_builder = req_builder.body(body)
-            req = req_builder.build()
+            def send_request(headers_payload: Dict[str, str]) -> Dict:
+                req_builder = lark.BaseRequest.builder() \
+                    .http_method(http_method_enum) \
+                    .uri(uri) \
+                    .token_types(token_types)
+                if queries:
+                    req_builder = req_builder.queries(queries)
+                if headers_payload:
+                    req_builder = req_builder.headers(headers_payload)
+                if body is not None:
+                    req_builder = req_builder.body(body)
+                req = req_builder.build()
 
-            resp = self.client.request(req)
-            raw = getattr(getattr(resp, "raw", None), "content", None)
-            content = raw if isinstance(raw, (bytes, bytearray)) else b""
-            log_id = None
-            get_log_id = getattr(resp, "get_log_id", None)
-            if callable(get_log_id):
-                log_id = get_log_id()
-            success = resp.success()
-            code = 0 if success else int(getattr(resp, "code", -1) or -1)
-            return self._wrap_result(code=code, msg=resp.msg, data={"content": content, "log_id": log_id})
+                resp = self.client.request(req)
+                raw = getattr(getattr(resp, "raw", None), "content", None)
+                content = raw if isinstance(raw, (bytes, bytearray)) else b""
+                log_id = None
+                get_log_id = getattr(resp, "get_log_id", None)
+                if callable(get_log_id):
+                    log_id = get_log_id()
+                success = resp.success()
+                code = 0 if success else int(getattr(resp, "code", -1) or -1)
+                return self._wrap_result(code=code, msg=resp.msg, data={"content": content, "log_id": log_id})
+
+            result = send_request(final_headers)
+            if token_type == "user" and result.get("code") in TOKEN_RETRY_CODES:
+                refreshed = self._refresh_user_access_token()
+                if refreshed:
+                    retry_headers = dict(final_headers)
+                    retry_headers["Authorization"] = f"Bearer {refreshed}"
+                    result = send_request(retry_headers)
+            return self._map_auth_result(result, path)
         except Exception as e:
             return self._wrap_exception(e, "请求")
 
@@ -327,6 +388,361 @@ class _FeishuCore:
             result["log_id"] = log_id
         if text:
             result["text"] = text
+        return result
+
+    def _map_auth_result(self, result: Dict, api_name: str) -> Dict:
+        code = result.get("code")
+        if code == LARK_ERROR["APP_SCOPE_MISSING"]:
+            return self._wrap_result(
+                code=code,
+                msg="应用权限不足，请管理员在开放平台开通权限",
+                data={"api": api_name, "auth_required": "app", "raw": result.get("data")},
+                log_id=result.get("log_id"),
+                text=result.get("text"),
+            )
+        if code == LARK_ERROR["USER_SCOPE_INSUFFICIENT"]:
+            return self._wrap_result(
+                code=code,
+                msg="用户权限不足，需要授权",
+                data={"api": api_name, "auth_required": "user", "raw": result.get("data")},
+                log_id=result.get("log_id"),
+                text=result.get("text"),
+            )
+        return result
+
+    def _resolve_oauth_endpoints(self, brand: Optional[str] = None) -> Dict[str, str]:
+        brand_value = (brand or "").strip().lower()
+        if not brand_value:
+            domain = (self.domain or "").lower()
+            brand_value = "lark" if "larksuite.com" in domain else "feishu"
+        if brand_value == "lark":
+            return {
+                "device_authorization": "https://accounts.larksuite.com/oauth/v1/device_authorization",
+                "token": "https://open.larksuite.com/open-apis/authen/v2/oauth/token",
+            }
+        return {
+            "device_authorization": "https://accounts.feishu.cn/oauth/v1/device_authorization",
+            "token": "https://open.feishu.cn/open-apis/authen/v2/oauth/token",
+        }
+
+    def _http_post_form(self, url: str, data: Dict[str, str], headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        payload = urlencode(data).encode("utf-8")
+        req_headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if headers:
+            req_headers.update(headers)
+        req = Request(url, data=payload, headers=req_headers, method="POST")
+        try:
+            with urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+            return json.loads(raw.decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, ValueError) as e:
+            raise RuntimeError(f"oauth http failed: {e}")
+
+    def _scope_covers(self, granted_scope: str, required_scopes: List[str]) -> bool:
+        granted = set([s for s in (granted_scope or "").split() if s])
+        required = set([s for s in required_scopes if s])
+        return required.issubset(granted)
+
+    def set_user_token(self, user_open_id: str, *, access_token: str, refresh_token: str = "", scope: str = "", expires_in: int = 7200, refresh_expires_in: int = 604800) -> None:
+        now = int(time.time() * 1000)
+        record = {
+            "user_open_id": user_open_id,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "scope": scope,
+            "expires_at": now + int(expires_in) * 1000,
+            "refresh_expires_at": now + int(refresh_expires_in) * 1000,
+            "granted_at": now,
+        }
+        with self._uat_store_lock:
+            self._uat_store[user_open_id] = record
+            if user_open_id not in self._uat_refresh_locks:
+                self._uat_refresh_locks[user_open_id] = Lock()
+
+    def _get_user_token_record(self, user_open_id: str) -> Optional[Dict[str, Any]]:
+        with self._uat_store_lock:
+            record = self._uat_store.get(user_open_id)
+            return dict(record) if isinstance(record, dict) else None
+
+    def _refresh_user_token_for_user(self, user_open_id: str, brand: Optional[str] = None) -> Optional[str]:
+        record = self._get_user_token_record(user_open_id)
+        if not record:
+            return None
+        now_ms = int(time.time() * 1000)
+        refresh_expires_at = int(record.get("refresh_expires_at") or 0)
+        if refresh_expires_at and now_ms >= refresh_expires_at:
+            with self._uat_store_lock:
+                self._uat_store.pop(user_open_id, None)
+            return None
+
+        lock = self._uat_refresh_locks.get(user_open_id)
+        if lock is None:
+            lock = Lock()
+            self._uat_refresh_locks[user_open_id] = lock
+
+        with lock:
+            record = self._get_user_token_record(user_open_id)
+            if not record:
+                return None
+            endpoints = self._resolve_oauth_endpoints(brand)
+            payload = {
+                "grant_type": "refresh_token",
+                "refresh_token": str(record.get("refresh_token") or ""),
+                "client_id": str(self.app_id),
+                "client_secret": str(self.app_secret),
+            }
+
+            data = self._http_post_form(endpoints["token"], payload)
+            code = data.get("code")
+            error = data.get("error")
+
+            if (code is not None and int(code) != 0) or error:
+                if code is not None and int(code) in REFRESH_TOKEN_RETRYABLE:
+                    data = self._http_post_form(endpoints["token"], payload)
+                    code = data.get("code")
+                    error = data.get("error")
+                    if (code is not None and int(code) != 0) or error:
+                        with self._uat_store_lock:
+                            self._uat_store.pop(user_open_id, None)
+                        return None
+                else:
+                    with self._uat_store_lock:
+                        self._uat_store.pop(user_open_id, None)
+                    return None
+
+            access_token = data.get("access_token")
+            if not access_token:
+                with self._uat_store_lock:
+                    self._uat_store.pop(user_open_id, None)
+                return None
+
+            refresh_token = data.get("refresh_token") or record.get("refresh_token") or ""
+            expires_in = int(data.get("expires_in") or 7200)
+            refresh_expires_in = int(data.get("refresh_token_expires_in") or 0)
+            scope = str(data.get("scope") or record.get("scope") or "")
+            if not refresh_expires_in:
+                refresh_expires_in = max(int((refresh_expires_at - now_ms) / 1000), expires_in)
+            self.set_user_token(
+                user_open_id,
+                access_token=str(access_token),
+                refresh_token=str(refresh_token),
+                scope=scope,
+                expires_in=expires_in,
+                refresh_expires_in=refresh_expires_in,
+            )
+            return str(access_token)
+
+    def get_valid_user_access_token(self, user_open_id: str, required_scopes: Optional[List[str]] = None, brand: Optional[str] = None) -> Optional[str]:
+        record = self._get_user_token_record(user_open_id)
+        if not record:
+            return None
+        if required_scopes and not self._scope_covers(str(record.get("scope") or ""), required_scopes):
+            return None
+        now_ms = int(time.time() * 1000)
+        expires_at = int(record.get("expires_at") or 0)
+        if expires_at and now_ms < expires_at - 60_000:
+            return str(record.get("access_token") or "")
+        refreshed = self._refresh_user_token_for_user(user_open_id, brand=brand)
+        return refreshed
+
+    def oauth_request_device_authorization(self, scope: str, brand: Optional[str] = None) -> Dict:
+        endpoints = self._resolve_oauth_endpoints(brand)
+        scope_value = (scope or "").strip()
+        if "offline_access" not in scope_value.split():
+            scope_value = (scope_value + " offline_access").strip() if scope_value else "offline_access"
+        basic = base64.b64encode(f"{self.app_id}:{self.app_secret}".encode("utf-8")).decode("utf-8")
+        data = self._http_post_form(
+            endpoints["device_authorization"],
+            {"client_id": str(self.app_id), "scope": scope_value},
+            headers={"Authorization": f"Basic {basic}"},
+        )
+        if data.get("error"):
+            return self._wrap_result(code=-1, msg=str(data.get("error_description") or data.get("error")), data=data)
+        if not data.get("device_code"):
+            return self._wrap_result(code=-1, msg="device_authorization failed", data=data)
+        return self._wrap_result(
+            code=0,
+            msg="ok",
+            data={
+                "device_code": data.get("device_code"),
+                "user_code": data.get("user_code"),
+                "verification_uri": data.get("verification_uri"),
+                "verification_uri_complete": data.get("verification_uri_complete") or data.get("verification_uri"),
+                "expires_in": int(data.get("expires_in") or 240),
+                "interval": int(data.get("interval") or 5),
+                "scope": scope_value,
+            },
+        )
+
+    def oauth_poll_device_token(
+        self,
+        *,
+        user_open_id: str,
+        device_code: str,
+        interval: int,
+        expires_in: int,
+        brand: Optional[str] = None,
+    ) -> Dict:
+        endpoints = self._resolve_oauth_endpoints(brand)
+        deadline = time.time() + int(expires_in)
+        poll_interval = max(int(interval), 1)
+        while time.time() < deadline:
+            time.sleep(poll_interval)
+            data = self._http_post_form(
+                endpoints["token"],
+                {
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "device_code": device_code,
+                    "client_id": str(self.app_id),
+                    "client_secret": str(self.app_secret),
+                },
+            )
+            if data.get("access_token"):
+                access_token = str(data.get("access_token"))
+                refresh_token = str(data.get("refresh_token") or "")
+                token_scope = str(data.get("scope") or "")
+                token_expires_in = int(data.get("expires_in") or 7200)
+                refresh_expires_in = int(data.get("refresh_token_expires_in") or 604800)
+                if not refresh_token:
+                    refresh_expires_in = token_expires_in
+                self.set_user_token(
+                    user_open_id,
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    scope=token_scope,
+                    expires_in=token_expires_in,
+                    refresh_expires_in=refresh_expires_in,
+                )
+                return self._wrap_result(code=0, msg="ok", data={"user_open_id": user_open_id, "scope": token_scope})
+            err = str(data.get("error") or "")
+            if err == "authorization_pending":
+                continue
+            if err == "slow_down":
+                poll_interval = min(poll_interval + 5, 60)
+                continue
+            if err == "access_denied":
+                return self._wrap_result(code=-1, msg="用户拒绝了授权", data=data)
+            if err in {"expired_token", "invalid_grant"}:
+                return self._wrap_result(code=-1, msg="授权码已过期，请重新发起", data=data)
+            if err:
+                return self._wrap_result(code=-1, msg=str(data.get("error_description") or err), data=data)
+        return self._wrap_result(code=-1, msg="授权超时，请重新发起", data=None)
+
+    def build_oauth_auth_card(self, *, verification_uri_complete: str, expires_min: int, scope: str) -> Dict[str, Any]:
+        url = verification_uri_complete
+        multi_url = {"url": url, "pc_url": url, "android_url": url, "ios_url": url}
+        scope_lines = "\n".join([f"- {s}" for s in (scope or "").split() if s])
+        content = f"请点击下方按钮完成授权。\n\n需要的权限：\n{scope_lines}\n\n有效期：{int(expires_min)} 分钟"
+        return {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": False},
+            "header": {
+                "title": {"tag": "plain_text", "content": "需要授权"},
+                "template": "blue",
+                "icon": {"tag": "standard_icon", "token": "lock-chat_filled"},
+            },
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": content},
+                    {
+                        "tag": "action",
+                        "actions": [
+                            {"tag": "button", "text": {"tag": "plain_text", "content": "去授权"}, "type": "primary", "multi_url": multi_url}
+                        ],
+                    },
+                ]
+            },
+        }
+
+    def send_oauth_auth_card(self, *, receive_id_type: str, receive_id: str, card: Dict[str, Any]) -> Dict:
+        return self._request_with_token(
+            method="POST",
+            path="/open-apis/im/v1/messages",
+            params={"receive_id_type": receive_id_type},
+            body={
+                "receive_id": receive_id,
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+            },
+        )
+
+    def user_request_with_auto_auth(
+        self,
+        *,
+        user_open_id: str,
+        required_scopes: List[str],
+        receive_id_type: str,
+        receive_id: str,
+        method: str,
+        path: str,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        body: Optional[Any] = None,
+        wait_for_auth: bool = False,
+        auth_timeout_sec: int = 300,
+        brand: Optional[str] = None,
+    ) -> Dict:
+        token = self.get_valid_user_access_token(user_open_id, required_scopes=required_scopes, brand=brand)
+        if not token:
+            scope = " ".join([s for s in required_scopes if s]).strip()
+            auth = self.oauth_request_device_authorization(scope, brand=brand)
+            if auth.get("code") != 0:
+                return auth
+            info = auth.get("data") or {}
+            card = self.build_oauth_auth_card(
+                verification_uri_complete=str(info.get("verification_uri_complete") or ""),
+                expires_min=max(int(info.get("expires_in") or 240) // 60, 1),
+                scope=str(info.get("scope") or scope),
+            )
+            self.send_oauth_auth_card(receive_id_type=receive_id_type, receive_id=receive_id, card=card)
+            if not wait_for_auth:
+                return self._wrap_result(
+                    code=LARK_ERROR["USER_SCOPE_INSUFFICIENT"],
+                    msg="need_user_authorization",
+                    data={
+                        "auth_required": "user",
+                        "user_open_id": user_open_id,
+                        "required_scopes": required_scopes,
+                        "device_code": info.get("device_code"),
+                        "interval": info.get("interval"),
+                        "expires_in": info.get("expires_in"),
+                        "verification_uri_complete": info.get("verification_uri_complete"),
+                    },
+                )
+            poll = self.oauth_poll_device_token(
+                user_open_id=user_open_id,
+                device_code=str(info.get("device_code") or ""),
+                interval=int(info.get("interval") or 5),
+                expires_in=min(int(info.get("expires_in") or 240), int(auth_timeout_sec)),
+                brand=brand,
+            )
+            if poll.get("code") != 0:
+                return poll
+            token = self.get_valid_user_access_token(user_open_id, required_scopes=required_scopes, brand=brand)
+            if not token:
+                return self._wrap_result(code=-1, msg="授权完成但未获取到 token", data=None)
+
+        result = self._request_with_token(
+            method=method,
+            path=path,
+            token_type="user",
+            user_access_token=token,
+            headers=headers,
+            params=params,
+            body=body,
+        )
+        if result.get("code") in TOKEN_RETRY_CODES:
+            refreshed = self._refresh_user_token_for_user(user_open_id, brand=brand)
+            if refreshed:
+                result = self._request_with_token(
+                    method=method,
+                    path=path,
+                    token_type="user",
+                    user_access_token=refreshed,
+                    headers=headers,
+                    params=params,
+                    body=body,
+                )
         return result
 
     def _parse_lark_response(self, resp: Any) -> Dict:
